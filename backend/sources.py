@@ -6,13 +6,22 @@ import time
 import xml.etree.ElementTree as ET
 
 import httpx
-
+import threading
 from . import config
 
 log = logging.getLogger(__name__)
 NS = {"a": "http://www.w3.org/2005/Atom"}
 MAX_KEYWORDS = 3
+_PACE_LOCKS: dict[str, threading.Lock] = {}
 
+
+def _pace(source: str, min_interval: float) -> None:
+    """Make parallel threads take turns, at least min_interval apart, per source."""
+    with _PACE_LOCKS.setdefault(source, threading.Lock()):
+        wait = min_interval - (time.monotonic() - _LAST_CALL.get(source, 0.0))
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL[source] = time.monotonic()
 # Shared client with a descriptive User-Agent (critical to avoid arXiv 429s)
 _CLIENT = httpx.Client(
     timeout=45.0,
@@ -36,12 +45,9 @@ def _request_with_retry(
 ) -> httpx.Response:
     """Enforces per-source pacing and retries 429/5xx/timeouts with exponential backoff."""
     for attempt in range(max_retries):
-        elapsed = time.monotonic() - _LAST_CALL.get(source, 0.0)
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
+        _pace(source, min_interval)
 
         try:
-            _LAST_CALL[source] = time.monotonic()
             r = _CLIENT.get(url, params=params, headers=headers or {})
 
             if r.status_code in (429, 500, 502, 503, 504):
@@ -177,8 +183,42 @@ def _openalex(query: str, n: int) -> list[dict]:
         })
     return out
 
+def _serpapi(query: str, n: int) -> list[dict]:
+    """Google Scholar through SerpAPI (needs SERPAPI_KEY; every call uses one search credit)."""
+    if not config.SERPAPI_KEY:
+        return []
+    r = _request_with_retry(
+        "https://serpapi.com/search.json",
+        {"engine": "google_scholar", "q": query, "num": min(n, 20), "api_key": config.SERPAPI_KEY},
+        source="serpapi", min_interval=1.0, max_retries=2,
+    )
+    r.raise_for_status()
+    data = r.json()
+    err = data.get("error")
+    if err and "hasn't returned any results" not in err:
+        raise RuntimeError(err)
+    out = []
+    for d in data.get("organic_results", []):
+        title, snippet = d.get("title"), d.get("snippet")
+        if not title or not snippet:
+            continue
+        info = d.get("publication_info") or {}
+        years = re.findall(r"\b(?:19|20)\d{2}\b", info.get("summary", ""))
+        link = d.get("link") or ""
+        m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", link)
+        pid = f"arxiv:{m.group(1)}" if m else f"serpapi:{d.get('result_id') or link}"
+        pdf = next((x["link"] for x in d.get("resources", []) if x.get("file_format") == "PDF"), "")
+        out.append({
+            "paper_id": pid, "title": title,
+            "authors": ", ".join(a.get("name", "") for a in info.get("authors", [])),
+            "year": int(years[-1]) if years else None,
+            "abstract": snippet, "url": link, "pdf_url": pdf,
+            "source": "google_scholar",
+            "citations": (d.get("inline_links") or {}).get("cited_by", {}).get("total"),
+        })
+    return out
 
-FETCHERS = {"arxiv": _arxiv, "semantic_scholar": _s2, "openalex": _openalex}
+FETCHERS = {"semantic_scholar": _s2, "serpapi": _serpapi, "arxiv": _arxiv, "openalex": _openalex}
 
 
 def web_search(keywords: list[str], year_from: int | None = None, per_query: int = 6) -> list[dict]:

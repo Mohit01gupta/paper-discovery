@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 import qdrant_client.models
 from . import compare, graph, ingest, store
+import re
 
 app = FastAPI(title="Research Paper Discovery")
 
@@ -29,7 +30,17 @@ def search(req: SearchReq):
         return graph.run_search(req.question, req.use_web)
     except Exception as e:
         raise HTTPException(502, f"Search failed: {e}")
+import logging
+class RedactKeys(logging.Filter):
+    def filter(self, record):
+        record.msg = re.sub(r"(api[_-]?key)=[^&\"'\s]+", r"\1=***", record.getMessage())
+        record.args = ()
+        return True
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")  # first
+
+for h in logging.getLogger().handlers:
+    h.addFilter(RedactKeys())
 
 @app.get("/papers")
 def papers():
