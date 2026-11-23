@@ -28,6 +28,11 @@ EMBED_API_KEY = os.getenv("EMBED_API_KEY", "")
 EMBED_CA_CERT = _path(os.getenv("EMBED_CA_CERT_PATH", "certs/vm02-ca.crt"))
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-small-en-v1.5")
 
+
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "8"))
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
 S2_API_KEY = os.getenv("S2_API_KEY", "")
