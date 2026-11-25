@@ -1,10 +1,13 @@
 """FastAPI backend.  Run:  uvicorn backend.main:app --port 8000
 
 Access rules: everything except /health and /auth/login needs a login token;
-uploading PDFs needs the admin role.
+uploading PDFs and deleting vectors need the admin role.
+Note: Qdrant runs in local embedded mode (no separate server), so run uvicorn
+with a single worker (--workers 1) to avoid Qdrant directory lock conflicts.
 """
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,11 +27,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Research Paper Discovery", lifespan=lifespan)
 if config.CORS_ORIGINS:
-    app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS,
-                       allow_methods=["*"], allow_headers=["*"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ORIGINS,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 else:  # development: the Flutter web dev server runs on a random localhost port
-    app.add_middleware(CORSMiddleware, allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
-                       allow_methods=["*"], allow_headers=["*"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 class LoginReq(BaseModel):
@@ -41,9 +52,18 @@ class SearchReq(BaseModel):
     use_web: bool = True
 
 
+class VectorSearchReq(BaseModel):
+    query: str | None = Field(default=None, max_length=1000)
+    top_k: int = Field(default=20, ge=1, le=200)
+    year_from: int | None = Field(default=None, ge=1900, le=2100)
+    paper_ids: list[str] = Field(default=[], max_length=50)
+    kind: Literal["abstract", "fulltext"] | None = None
+
+
 class CompareReq(BaseModel):
     paper_ids: list[str] = Field(max_length=3)
     focus: str | None = Field(default=None, max_length=200)
+
 
 class ChatCreate(BaseModel):
     title: str = Field(default="New chat", max_length=80)
@@ -111,6 +131,58 @@ def upload(file: UploadFile = File(...), admin: dict = Depends(auth.require_admi
     except Exception as e:
         raise _fail("Upload failed", e)
     return {"paper_id": p["paper_id"], "title": p["title"]}
+
+
+# ----------------------------------------------------------------------------- Qdrant vector routes
+@app.get("/vectors/stats")
+def vector_stats(admin: dict = Depends(auth.require_admin)):
+    try:
+        return store.collection_info()
+    except Exception as e:
+        raise _fail("Failed to read Qdrant stats", e)
+
+
+@app.post("/vectors/search")
+def vector_search(req: VectorSearchReq, admin: dict = Depends(auth.require_admin)):
+    try:
+        hits = store.search_or_list_chunks(
+            query=req.query,
+            k=req.top_k,
+            year_from=req.year_from,
+            paper_ids=req.paper_ids or None,
+            kind=req.kind,
+        )
+        return {"results": hits}
+    except Exception as e:
+        raise _fail("Vector search failed", e)
+
+
+@app.get("/vectors/papers/{paper_id}/chunks")
+def paper_chunk_counts(paper_id: str, user: dict = Depends(auth.current_user)):
+    if not store.has_paper(paper_id):
+        raise HTTPException(404, "Paper not found")
+    try:
+        abstract_cnt = store.count_chunks(paper_id, kind="abstract")
+        fulltext_cnt = store.count_chunks(paper_id, kind="fulltext")
+        return {
+            "paper_id": paper_id,
+            "abstract": abstract_cnt,
+            "fulltext": fulltext_cnt,
+            "total": abstract_cnt + fulltext_cnt,
+        }
+    except Exception as e:
+        raise _fail("Failed to count chunks", e)
+
+
+@app.delete("/vectors/papers/{paper_id}")
+def delete_paper_vectors(paper_id: str, admin: dict = Depends(auth.require_admin)):
+    if not store.has_paper(paper_id):
+        raise HTTPException(404, "Paper not found")
+    try:
+        store.delete_paper_vectors(paper_id)
+        return {"ok": True, "paper_id": paper_id}
+    except Exception as e:
+        raise _fail("Failed to delete vectors", e)
 
 
 def _own_chat(user: dict, chat_id: str) -> dict:

@@ -1,12 +1,89 @@
+import base64
+import hashlib
+import hmac
 import html
+import json
 import os
+import time
 
 import pandas as pd
 import requests
 import streamlit as st
 
 API = os.getenv("BACKEND_URL", "http://localhost:8000")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-in-production-secret-key").encode("utf-8")
+SESSION_TTL_HOURS = float(os.getenv("SESSION_TTL_HOURS", "1"))
+
 st.set_page_config(page_title="Research Paper Discovery", page_icon="📚", layout="wide")
+
+
+# ----------------------------------------------------------------------------- persistent auth helpers
+def _b64_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("ascii"))
+
+
+def make_auth_param(token: str, username: str, role: str, ttl_hours: float = SESSION_TTL_HOURS) -> str:
+    payload = {
+        "t": token,
+        "u": username,
+        "r": role,
+        "exp": int(time.time() + ttl_hours * 3600),
+    }
+    body = _b64_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sig = _b64_encode(hmac.new(SESSION_SECRET, body.encode("ascii"), hashlib.sha256).digest())
+    return f"{body}.{sig}"
+
+
+def parse_auth_param(param_val: str | None) -> dict | None:
+    if not param_val or "." not in param_val:
+        return None
+    body, sig = param_val.split(".", 1)
+    expected_sig = _b64_encode(hmac.new(SESSION_SECRET, body.encode("ascii"), hashlib.sha256).digest())
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+    try:
+        data = json.loads(_b64_decode(body).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if int(data.get("exp", 0)) <= int(time.time()):
+        return None
+    if not data.get("t") or not data.get("u") or not data.get("r"):
+        return None
+    return data
+
+
+def set_session_auth(token: str, username: str, role: str, ttl_hours: float = SESSION_TTL_HOURS):
+    st.session_state.update(token=token, username=username, role=role, active_chat=None)
+    st.query_params["auth"] = make_auth_param(token, username, role, ttl_hours=ttl_hours)
+
+
+def clear_session_auth():
+    for k in ("token", "username", "role", "active_chat"):
+        st.session_state.pop(k, None)
+    if "auth" in st.query_params:
+        del st.query_params["auth"]
+
+
+def restore_session_from_url():
+    if "token" in st.session_state:
+        return
+    restored = parse_auth_param(st.query_params.get("auth"))
+    if restored:
+        st.session_state.update(
+            token=restored["t"],
+            username=restored["u"],
+            role=restored["r"],
+        )
+    elif "auth" in st.query_params:
+        del st.query_params["auth"]
+
 
 # ----------------------------------------------------------------------------- theme (CSS)
 CSS = """<style>
@@ -316,9 +393,8 @@ def call(method, path, **kw):
     headers = {"Authorization": f"Bearer {st.session_state.token}"}
     try:
         r = requests.request(method, f"{API}{path}", headers=headers, timeout=300, **kw)
-        if r.status_code == 401:  # token expired or invalid
-            for k in ("token", "username", "role", "active_chat"):
-                st.session_state.pop(k, None)
+        if r.status_code == 401:  # backend token expired or invalid
+            clear_session_auth()
             st.rerun()
         r.raise_for_status()
         return r.json()
@@ -346,7 +422,7 @@ def login_form():
                     return
                 if r.ok:
                     d = r.json()
-                    st.session_state.update(token=d["access_token"], username=d["username"], role=d["role"], active_chat=None)
+                    set_session_auth(d["access_token"], d["username"], d["role"], ttl_hours=SESSION_TTL_HOURS)
                     st.rerun()
                 else:
                     try:
@@ -354,6 +430,8 @@ def login_form():
                     except ValueError:
                         st.error("Login failed")
 
+
+restore_session_from_url()
 
 if "token" not in st.session_state:
     login_form()
@@ -363,8 +441,6 @@ is_admin = st.session_state.role == "admin"
 chat_list = call("get", "/chats") or []
 titles = {c["id"]: c["title"] for c in chat_list}  # newest first
 
-# Keep active_chat None by default so users land on the common UI first;
-# clear it if the selected chat was deleted.
 if st.session_state.get("active_chat") not in titles:
     st.session_state.active_chat = None
 
@@ -407,20 +483,18 @@ with st.sidebar:
 
     st.divider()
     if st.button("Log out", use_container_width=True):
-        for k in ("token", "username", "role", "active_chat"):
-            st.session_state.pop(k, None)
+        clear_session_auth()
         st.rerun()
 
 lib = call("get", "/papers") or []
 active_chat_id = st.session_state.get("active_chat")
 
 # =============================================================================
-# VIEW 1: DEDICATED CHAT UI (when a chat is active)
+# VIEW 1: DEDICATED GEMINI-STYLE CHAT UI (when a chat is active)
 # =============================================================================
 if active_chat_id:
     chat_title = titles.get(active_chat_id, "New chat")
 
-    # Top bar with chat title on the left and close '✕' button on the top right
     head_left, head_right = st.columns([0.92, 0.08])
     with head_left:
         st.markdown(
@@ -433,7 +507,6 @@ if active_chat_id:
             st.session_state.active_chat = None
             st.rerun()
 
-    # Uploaded file selector bar (compact attachment/context bar)
     uploaded = [p for p in lib if p["source"] == "upload"]
     names = {p["paper_id"]: p["title"] for p in uploaded}
 
@@ -492,9 +565,15 @@ else:
                 f'<div class="stat"><div class="stat-v">{esc(st.session_state.role.capitalize())}</div><div class="stat-k">Access level</div></div>'
                 '</div>', unsafe_allow_html=True)
 
-    tab_search, tab_compare, tab_upload = st.tabs(["Search", "Compare", "Upload PDF"])
+    tab_names = ["Search", "Compare"]
+    if is_admin:
+        tab_names.extend(["Vector Search", "Upload PDF"])
 
-    # ------------------------------------------------------------------------- Search
+    tabs = st.tabs(tab_names)
+    tab_search, tab_compare = tabs[0], tabs[1]
+    tab_vectors = tabs[2] if is_admin else None
+    tab_upload = tabs[3] if is_admin else None
+
     with tab_search:
         q = st.text_input("Ask a research question", placeholder="How can small language models run on phones?")
         use_web = st.checkbox("Also search Google Scholar / arXiv / Semantic Scholar", value=True)
@@ -520,7 +599,6 @@ else:
                         if url.startswith(("http://", "https://")):
                             st.markdown(f"[Open paper ↗]({url})")
 
-    # ------------------------------------------------------------------------- Compare
     with tab_compare:
         labels = {p["paper_id"]: f"{p['title']} ({p['year'] or p['source']})" for p in lib}
         chosen = st.multiselect("Select 2-3 papers", list(labels), format_func=labels.get, max_selections=3)
@@ -536,18 +614,88 @@ else:
                 st.warning(res.get("error", "Unexpected response"))
                 st.code(res.get("raw", ""))
 
-    # ------------------------------------------------------------------------- Upload (admin only)
-    with tab_upload:
-        if not is_admin:
-            st.info("Only an admin can upload papers.")
-            st.stop()
-        flash = st.session_state.pop("flash", None)
-        if flash:
-            st.success(flash)
-        f = st.file_uploader("Drop a research paper (PDF)", type="pdf")
-        if f and st.button("Add to library", type="primary"):
-            with st.spinner("Extracting and indexing..."):
-                res = call("post", "/upload", files={"file": (f.name, f.getvalue(), "application/pdf")})
-            if res:
-                st.session_state.flash = f"Added: {res['title']}"
-                st.rerun()
+    if is_admin and tab_upload is not None:
+        with tab_upload:
+            flash = st.session_state.pop("flash", None)
+            if flash:
+                st.success(flash)
+            f = st.file_uploader("Drop a research paper (PDF)", type="pdf")
+            if f and st.button("Add to library", type="primary"):
+                with st.spinner("Extracting and indexing..."):
+                    res = call("post", "/upload", files={"file": (f.name, f.getvalue(), "application/pdf")})
+                if res:
+                    st.session_state.flash = f"Added: {res['title']}"
+                    st.rerun()
+    if is_admin and tab_vectors is not None:
+        with tab_vectors:
+            paper_titles = {p["paper_id"]: p["title"] for p in lib}
+
+            stats = call("get", "/vectors/stats")
+            if stats:
+                st.caption(
+                    f"Collection: **{esc(stats['collection'])}**  |  "
+                    f"Vectors: **{stats['points_count']}**  |  "
+                    f"Dim: **{stats['vector_size']}**  |  "
+                    f"Status: **{esc(stats['status'])}**"
+                )
+
+            v_query = st.text_input(
+                "Vector query (optional — leave blank to list chunks)",
+                placeholder="e.g. quantization memory latency (or leave empty to inspect chunks)",
+                key="vec_query",
+            )
+
+            c1, c2, c3 = st.columns([1, 1, 1])
+            with c1:
+                v_kind = st.selectbox(
+                    "Chunk type",
+                    options=[None, "abstract", "fulltext"],
+                    format_func=lambda x: "All chunks" if x is None else x,
+                    key="vec_kind",
+                )
+            with c2:
+                v_top_k = st.number_input("Max chunks", min_value=1, max_value=200, value=20, step=1, key="vec_top_k")
+            with c3:
+                use_year = st.checkbox("Filter by year", value=False, key="vec_use_year")
+                v_year_from = (
+                    st.number_input("Year from", min_value=1900, max_value=2100, value=2022, step=1, key="vec_year_from")
+                    if use_year
+                    else None
+                )
+
+            v_papers = st.multiselect(
+                "Select paper(s)",
+                options=list(paper_titles),
+                format_func=paper_titles.get,
+                key="vec_papers",
+            )
+
+            if st.button("Fetch / Search vectors", type="primary", key="vec_search_btn"):
+                payload = {
+                    "query": v_query.strip() if (v_query and v_query.strip()) else None,
+                    "top_k": int(v_top_k),
+                    "year_from": int(v_year_from) if v_year_from is not None else None,
+                    "paper_ids": v_papers,
+                    "kind": v_kind,
+                }
+                with st.spinner("Querying Qdrant..."):
+                    res = call("post", "/vectors/search", json=payload)
+
+                if res is not None:
+                    hits = res.get("results", [])
+                    if not hits:
+                        st.info("No matching chunks found.")
+                    for idx, h in enumerate(hits, start=1):
+                        pid = h.get("paper_id", "")
+                        ptitle = paper_titles.get(pid, pid or "Unknown paper")
+                        badges = ""
+                        if h.get("score") is not None:
+                            badges += chip(f"score {round(h['score'], 4)}", "cyan")
+                        badges += chip(h.get("kind") or "chunk", "violet")
+                        if h.get("year"):
+                            badges += chip(str(h["year"]))
+                        with st.expander(f"#{idx} — {ptitle}"):
+                            st.markdown(f'<div class="chips">{badges}</div>', unsafe_allow_html=True)
+                            st.write(h.get("text", ""))
+                            if pid:
+                                st.caption(f"Paper ID: {pid}")

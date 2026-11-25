@@ -3,7 +3,7 @@ import hashlib
 import logging
 import re
 from pathlib import Path
-
+from datetime import datetime, timezone
 import httpx
 
 from . import store
@@ -31,57 +31,66 @@ def ingest_fulltext(paper: dict, text: str, max_chunks: int = 240) -> int:
 
 def ingest_upload(filename: str, data: bytes) -> dict:
     text = pdf_to_text(data)
-    yr = None
-    # Split the paper into "Main Body" and "References" so cited papers don't cause false positives
+    if not text.strip():
+        raise ValueError("No text found in PDF (scanned PDFs need OCR)")
+
+    yr: int | None = None
     ref_split = re.split(r"\n\s*(?:References|Bibliography|REFERENCES|BIBLIOGRAPHY)\b", text, maxsplit=1)
     body_text = ref_split[0]
-    refs_text = ref_split[1] if len(ref_split) > 1 else text[-6000:]
+    header_text = body_text[:3000]
 
-    # 1. Check for modern arXiv ID anywhere in the main body (e.g., arXiv:2611.14584v1)
+    # 1. Check for modern arXiv ID in main body (e.g., arXiv:2611.14584v1)
     arxiv_match = re.search(r"arXiv\s*:\s*(\d{2})\d{2}\.\d+", body_text, re.IGNORECASE)
     if arxiv_match:
         yy = int(arxiv_match.group(1))
         yr = 2000 + yy if yy <= 90 else 1900 + yy
 
-    # 2. Check for explicit arXiv date stamp (e.g., "10 Nov 2026") in the main body
-    date_match = re.search(
-        r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+((?:19|20)\d{2})\b",
-        body_text,
-        re.IGNORECASE,
-    )
-    if date_match:
-        yr = int(date_match.group(1))
+    # 2. Check for explicit publication / copyright / conference lines near top
+    if yr is None:
+        patterns = [
+            r"(?:Published|Accepted|Available online)[^0-9\n]{0,25}((?:19|20)\d{2})",
+            r"(?:©|\(c\)|Copyright)\s*((?:19|20)\d{2})",
+            r"(?:Proceedings|Conference|Symposium|Journal|Transactions|IEEE|ACM|Springer|Elsevier)[^\n]{0,40}((?:19|20)\d{2})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, header_text, re.IGNORECASE)
+            if match:
+                yr = int(match.group(1))
+                break
 
-    # 2. Check for explicit publication, copyright, or conference lines near the top
-    patterns = [
-        r"(?:Published|Accepted|Available online)[^0-9\n]{0,25}((?:19|20)\d{2})",
-        r"(?:©|\(c\)|Copyright)\s*((?:19|20)\d{2})",
-        r"(?:Proceedings|Conference|Symposium|Journal|Transactions|IEEE|ACM|Springer|Elsevier)[^\n]{0,40}((?:19|20)\d{2})"
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        print(match)
-        if match:
-            yr = int(match.group(1))
+    # 3. Check explicit date in body (e.g., "10 Nov 2026")
+    if yr is None:
+        date_match = re.search(
+            r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+((?:19|20)\d{2})\b",
+            body_text[:5000],
+            re.IGNORECASE,
+        )
+        if date_match:
+            yr = int(date_match.group(1))
 
-    # 3. Fallback: Check the end of the text (References section) for the newest cited year
-    footer_text = text[-6000:]
-    ref_years = [int(y) for y in re.findall(r"\b((?:19|20)\d{2})\b", footer_text)]
-    valid_years = [y for y in ref_years if 1950 <= y <= 2026]
-    if valid_years:
-        yr  = max(valid_years)
-        print(valid_years)
-    if not text.strip():
-        raise ValueError("No text found in PDF (scanned PDFs need OCR)")
-    paper = {"paper_id": "upload:" + hashlib.sha1(data).hexdigest()[:12],
-             "title": Path(filename).stem, "authors": "", "year": yr,
-             "abstract": re.sub(r"\s+", " ", text)[:1500], "url": "", "pdf_url": "",
-             "source": "upload", "citations": None}
-    print(paper)
-    ingest_fulltext(paper, text)
+    # 4. Last-resort fallback only if still None
+    if yr is None:
+        max_yr = datetime.now(timezone.utc).year + 1
+        footer_text = text[-6000:]
+        ref_years = [int(y) for y in re.findall(r"\b((?:19|20)\d{2})\b", footer_text)]
+        valid_years = [y for y in ref_years if 1950 <= y <= max_yr]
+        if valid_years:
+            yr = max(valid_years)
+
+    paper = {
+        "paper_id": "upload:" + hashlib.sha1(data).hexdigest()[:12],
+        "title": Path(filename).stem,
+        "authors": "",
+        "year": yr,
+        "abstract": re.sub(r"\s+", " ", text)[:1500],
+        "url": "",
+        "pdf_url": "",
+        "source": "upload",
+        "citations": None,
+    }
     store.upsert_paper(paper)
+    ingest_fulltext(paper, text)
     return paper
-
 
 def ensure_fulltext(paper: dict) -> None:
     """Download and index the PDF of a paper if only its abstract is indexed."""
