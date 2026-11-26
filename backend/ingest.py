@@ -4,8 +4,7 @@ import logging
 import re
 from pathlib import Path
 from datetime import datetime, timezone
-import httpx
-
+from . import safe_fetch
 from . import store
 
 log = logging.getLogger(__name__)
@@ -97,8 +96,11 @@ def ensure_fulltext(paper: dict) -> None:
     if store.count_chunks(paper["paper_id"], "fulltext") or not paper.get("pdf_url"):
         return
     try:
-        r = httpx.get(paper["pdf_url"], timeout=60, follow_redirects=True)
-        r.raise_for_status()
-        ingest_fulltext(paper, pdf_to_text(r.content))
+        data = safe_fetch.fetch_pdf(paper["pdf_url"])
+        ingest_fulltext(paper, pdf_to_text(data))
     except Exception as e:
-        log.warning("Full text unavailable for %s: %s", paper["paper_id"], e)
+        log.warning(
+            "Full text unavailable for %s: %s",
+            paper["paper_id"],
+            e,
+        )

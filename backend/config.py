@@ -40,3 +40,17 @@ SOURCES = [s.strip() for s in os.getenv("SOURCES", "arxiv,semantic_scholar").spl
 
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Langfuse tracing (disabled unless BOTH keys are configured)
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_BASE_URL = os.getenv(
+    "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
+).rstrip("/")
+
+# Guardrails
+GUARD_PER_MINUTE = int(os.getenv("GUARD_PER_MINUTE", "10"))
+GUARD_PER_DAY = int(os.getenv("GUARD_PER_DAY", "200"))
+GUARD_CONCURRENT = int(os.getenv("GUARD_CONCURRENT", "2"))
+GUARD_WEB_SECONDS = int(os.getenv("GUARD_WEB_SECONDS", "90"))
+GUARD_PDF_MB = int(os.getenv("GUARD_PDF_MB", "25"))

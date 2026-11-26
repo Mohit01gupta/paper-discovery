@@ -9,7 +9,7 @@ import ssl
 import time
 
 import httpx
-
+from . import tracing
 from . import config
 
 log = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ def _embed_batch(batch: list[str]) -> list[list[float]]:
     raise RuntimeError("Embedding call failed after retries")
 
 
-def embed(texts: list[str]) -> list[list[float]]:
+def _embed_impl(texts: list[str]) -> list[list[float]]:
     if not config.EMBED_API_KEY or config.EMBED_API_KEY == "YOUR_EMBEDDINGS_KEY":
         raise RuntimeError("EMBED_API_KEY is not set. Add it to .env")
     out: list[list[float]] = []
@@ -69,3 +69,23 @@ def embed(texts: list[str]) -> list[list[float]]:
         batch = [(_CTRL.sub(" ", t).strip()[:MAX_CHARS] or "empty") for t in texts[i:i + BATCH]]
         out.extend(_embed_batch(batch))
     return out
+
+def embed(texts: list[str]) -> list[list[float]]:
+    with tracing.span(
+        "embed",
+        as_type="embedding",
+        model=config.EMBED_MODEL,
+        input={
+            "texts": len(texts),
+            "first": [t[:200] for t in texts[:5]],
+        },
+    ) as obs:
+
+        out = _embed_impl(texts)
+
+        obs.update(output={
+            "vectors": len(out),
+            "dimensions": DIM,
+        })
+
+        return out

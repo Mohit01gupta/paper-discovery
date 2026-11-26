@@ -9,7 +9,7 @@ import re
 import ssl
 import threading
 import time
-
+from . import guardrails, tracing
 import httpx
 
 from . import config
@@ -44,7 +44,7 @@ def _strip_think(text: str) -> str:
     return text.replace("<think>", "").strip()
 
 
-def chat(messages: list[dict], max_tokens: int = 512, temperature: float = 0.2) -> str:
+def _chat_impl(messages: list[dict], max_tokens: int = 512, temperature: float = 0.2) -> str:
     global _send_template_kwargs
     if not config.API_KEY or config.API_KEY == "GROUP_API_KEY":
         raise RuntimeError("GROUP_API_KEY is not set. Add your key to .env")
@@ -82,9 +82,67 @@ def chat(messages: list[dict], max_tokens: int = 512, temperature: float = 0.2) 
                 time.sleep(delays[attempt])
                 continue
             r.raise_for_status()
-            return _strip_think(r.json()["choices"][0]["message"]["content"] or "")
+            payload = r.json()
+            usage = payload.get("usage") or {}
+
+            answer = _strip_think(
+                payload["choices"][0]["message"]["content"] or ""
+            )
+
+            usage_details = {}
+
+            if isinstance(usage.get("prompt_tokens"), int):
+                usage_details["input"] = usage["prompt_tokens"]
+
+            if isinstance(usage.get("completion_tokens"), int):
+                usage_details["output"] = usage["completion_tokens"]
+
+            return answer, usage_details
     raise RuntimeError("LLM call failed after retries")
 
+def chat(
+    messages: list[dict],
+    max_tokens: int = 512,
+    temperature: float = 0.2,
+) -> str:
+
+    safe_messages = []
+
+    for message in messages:
+        item = dict(message)
+
+        if isinstance(item.get("content"), str):
+            item["content"] = guardrails.neutralize(
+                item["content"]
+            )
+
+        safe_messages.append(item)
+
+    with tracing.span(
+        "LLM generation",
+        as_type="generation",
+        model=config.MODEL,
+        input=safe_messages,
+        metadata={
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        },
+    ) as obs:
+
+        answer, usage = _chat_impl(
+            safe_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        update = {"output": answer}
+
+        if usage:
+            update["usage_details"] = usage
+
+        obs.update(**update)
+
+        return answer
 
 def chat_json(messages: list[dict], **kw) -> dict:
     text = chat(messages, **kw)

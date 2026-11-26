@@ -2,6 +2,9 @@
 import re
 from . import embeddings, llm, store
 
+import secrets
+
+from . import guardrails, tracing
 TOP_K = 8
 
 SECTION_GUIDE = """Typical parts of a research paper and what they contain:
@@ -90,7 +93,29 @@ def answer_question(question: str, paper_ids: list[str] | None = None, history: 
         prev = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
         query = f"{prev} {question}".strip()
 
-    hits = store.search_chunks(embeddings.embed([query])[0], k=TOP_K, paper_ids=allowed)
+    query_vector = embeddings.embed([query])[0]
+
+    with tracing.span(
+        "chat paper retrieval",
+        as_type="retriever",
+        input={
+            "paper_ids": allowed,
+            "top_k": TOP_K,
+        },
+    ) as obs:
+
+        hits = store.search_chunks(
+            query_vector,
+            k=TOP_K,
+            paper_ids=allowed,
+        )
+
+        obs.update(output={
+            "retrieved_chunks": len(hits),
+            "retrieved_papers": len({
+                h["paper_id"] for h in hits
+            }),
+        })
 
     if AUTHOR_RE.search(question):
         early = _early_chunks(allowed, max_idx=2)
@@ -111,10 +136,43 @@ def answer_question(question: str, paper_ids: list[str] | None = None, history: 
         pos_label = "abstract" if kind == "abstract" else f"{kind} chunk #{idx}"
         enriched_hits.append({**h, "_kind": kind, "_idx": idx, "_section": section, "_pos": pos_label})
 
-    excerpts = "\n\n".join(
-        f"[{i}] Paper: {library[h['paper_id']]['title']} | Position: {h['_pos']} | Likely Part: {h['_section']}\n{h['text']}"
-        for i, h in enumerate(enriched_hits, 1)
-    )
+    nonce = secrets.token_hex(8)
+    flagged = []
+    excerpt_blocks = []
+    safe_chunks = {}
+
+    for i, h in enumerate(enriched_hits, 1):
+        original_title = library[h["paper_id"]]["title"]
+
+        title, title_hit = guardrails.mask_injections(
+            original_title
+        )
+
+        text, text_hit = guardrails.mask_injections(
+            h["text"]
+        )
+
+        safe_chunks[i] = text
+
+        if title_hit or text_hit:
+            flagged.append(
+                guardrails.clean_display(original_title, 80)
+            )
+
+        block = guardrails.fence(
+            "paper",
+            nonce,
+            f"id={h['paper_id']} title={title}",
+            (
+                f"Position: {h['_pos']} | "
+                f"Likely Part: {h['_section']}\n"
+                f"{text}"
+            ),
+        )
+
+        excerpt_blocks.append(f"[{i}] {block}")
+
+    excerpts = "\n\n".join(excerpt_blocks)
 
     convo = ""
     if history:
@@ -128,17 +186,31 @@ def answer_question(question: str, paper_ids: list[str] | None = None, history: 
         max_tokens=700,
         temperature=0.15,
     )
+    answer, warnings = guardrails.check_answer(
+        answer,
+        len(enriched_hits),
+        SYSTEM,
+    )
 
+    if flagged:
+        warnings.append(
+            "Instruction-like text was hidden in: "
+            + ", ".join(sorted(set(flagged)))
+        )
+
+    if warnings:
+        answer += "\n\n" + "\n".join(warnings)
     sources = [
     {
         "n": i,
         "paper_id": h["paper_id"],
-        "title": library[h["paper_id"]]["title"],
+        "title": guardrails.clean_display(library[h["paper_id"]]["title"], 300),
         "section": h["_section"],
         "position": h["_pos"],
         "idx": h["_idx"],
         "score": round(h["score"], 3) if h.get("score") is not None else None,
-        "snippet": h["text"][:300],
+        "snippet": guardrails.clean_display( safe_chunks[i], 300, links=False),
     }
     for i, h in enumerate(enriched_hits, 1)]
-    return {"answer": answer, "sources": sources}
+    return {"answer": answer, "sources": sources,
+            "warnings": warnings, "masked_papers": sorted(set(flagged))}    

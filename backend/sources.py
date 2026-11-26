@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 import threading
-from . import config
+from . import config, tracing
 
 log = logging.getLogger(__name__)
 NS = {"a": "http://www.w3.org/2005/Atom"}
@@ -15,12 +15,25 @@ MAX_KEYWORDS = 3
 _PACE_LOCKS: dict[str, threading.Lock] = {}
 
 
-def _pace(source: str, min_interval: float) -> None:
+def _pace(
+    source: str,
+    min_interval: float,
+    deadline: float | None = None,
+) -> None:
     """Make parallel threads take turns, at least min_interval apart, per source."""
     with _PACE_LOCKS.setdefault(source, threading.Lock()):
         wait = min_interval - (time.monotonic() - _LAST_CALL.get(source, 0.0))
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                raise TimeoutError("Web-search time budget exceeded")
+
+            wait = min(wait, remaining)
         if wait > 0:
             time.sleep(wait)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Web-search time budget exceeded")
         _LAST_CALL[source] = time.monotonic()
 # Shared client with a descriptive User-Agent (critical to avoid arXiv 429s)
 _CLIENT = httpx.Client(
@@ -42,13 +55,28 @@ def _request_with_retry(
     min_interval: float,
     headers: dict | None = None,
     max_retries: int = 3,
+    deadline: float | None = None,
 ) -> httpx.Response:
     """Enforces per-source pacing and retries 429/5xx/timeouts with exponential backoff."""
     for attempt in range(max_retries):
-        _pace(source, min_interval)
+        _pace(source, min_interval, deadline)
 
         try:
-            r = _CLIENT.get(url, params=params, headers=headers or {})
+            remaining = (
+                deadline - time.monotonic()
+                if deadline is not None
+                else 45.0
+            )
+
+            if remaining <= 0:
+                raise TimeoutError("Web-search time budget exceeded")
+
+            r = _CLIENT.get(
+                url,
+                params=params,
+                headers=headers or {},
+                timeout=min(45.0, remaining),
+            )
 
             if r.status_code in (429, 500, 502, 503, 504):
                 retry_after = r.headers.get("Retry-After")
@@ -57,6 +85,8 @@ def _request_with_retry(
                 else:
                     wait = (3.0 * (2 ** attempt)) + random.uniform(0.5, 1.5)
                 log.info("%s rate-limited (%s), retrying in %.1fs...", source, r.status_code, wait)
+                if deadline is not None and time.monotonic() + wait >= deadline:
+                    raise TimeoutError("Web-search time budget exceeded")
                 time.sleep(wait)
                 continue
 
@@ -77,12 +107,12 @@ def _request_with_retry(
     )
 
 
-def _arxiv(query: str, n: int) -> list[dict]:
+def _arxiv(query: str, n: int, deadline=None) -> list[dict]:
     r = _request_with_retry(
         url="https://export.arxiv.org/api/query",
         params={"search_query": f'all:"{query}"', "max_results": n, "sortBy": "relevance"},
         source="arxiv",
-        min_interval=3.2,  # arXiv strictly enforces >= 3s between calls
+        min_interval=3.2,deadline=deadline,  # arXiv strictly enforces >= 3s between calls
     )
     out = []
     for e in ET.fromstring(r.text).findall("a:entry", NS):
@@ -104,7 +134,7 @@ def _arxiv(query: str, n: int) -> list[dict]:
     return out
 
 
-def _s2(query: str, n: int) -> list[dict]:
+def _s2(query: str, n: int, deadline=None) -> list[dict]:
     api_key = getattr(config, "S2_API_KEY", None)
     headers = {"x-api-key": api_key} if api_key else {}
     r = _request_with_retry(
@@ -116,7 +146,7 @@ def _s2(query: str, n: int) -> list[dict]:
         },
         source="semantic_scholar",
         min_interval=1.2 if api_key else 3.0,
-        headers=headers,
+        headers=headers,deadline=deadline,
     )
     out = []
     for d in r.json().get("data", []):
@@ -143,7 +173,7 @@ def _s2(query: str, n: int) -> list[dict]:
     return out
 
 
-def _openalex(query: str, n: int) -> list[dict]:
+def _openalex(query: str, n: int, deadline=None) -> list[dict]:
     """Reliable open-access fallback (10 req/sec free limit, no API key needed)."""
     r = _request_with_retry(
         url="https://openalex.org",
@@ -154,7 +184,7 @@ def _openalex(query: str, n: int) -> list[dict]:
             "select": "id,doi,title,publication_year,authorships,cited_by_count,abstract_inverted_index,primary_location,open_access",
         },
         source="openalex",
-        min_interval=0.2,
+        min_interval=0.2,deadline=deadline,
     )
     out = []
     for d in r.json().get("results", []):
@@ -183,14 +213,14 @@ def _openalex(query: str, n: int) -> list[dict]:
         })
     return out
 
-def _serpapi(query: str, n: int) -> list[dict]:
+def _serpapi(query: str, n: int, deadline=None) -> list[dict]:
     """Google Scholar through SerpAPI (needs SERPAPI_KEY; every call uses one search credit)."""
     if not config.SERPAPI_KEY:
         return []
     r = _request_with_retry(
         "https://serpapi.com/search.json",
         {"engine": "google_scholar", "q": query, "num": min(n, 20), "api_key": config.SERPAPI_KEY},
-        source="serpapi", min_interval=1.0, max_retries=2,
+        source="serpapi", min_interval=1.0, max_retries=2,deadline=deadline,
     )
     r.raise_for_status()
     data = r.json()
@@ -221,23 +251,55 @@ def _serpapi(query: str, n: int) -> list[dict]:
 FETCHERS = {"semantic_scholar": _s2, "serpapi": _serpapi, "arxiv": _arxiv, "openalex": _openalex}
 
 
-def web_search(keywords: list[str], year_from: int | None = None, per_query: int = 6) -> list[dict]:
+def web_search(
+    keywords: list[str],
+    year_from: int | None = None,
+    per_query: int = 6,
+    time_budget: int | None = None,
+) -> list[dict]:
+
+    deadline = (
+        time.monotonic() + time_budget
+        if time_budget is not None
+        else None
+    )
+
     found: dict[str, dict] = {}
     kws = keywords[:MAX_KEYWORDS]
+
     for kw in kws:
         for name in config.SOURCES:
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return list(found.values())
+
             fn = FETCHERS.get(name)
+
             if not fn:
                 continue
+
             try:
-                papers = fn(kw, per_query)
+                with tracing.span(f"source: {name}", as_type="tool", input={"query": kw}) as obs:
+                    papers = fn(kw, per_query, deadline=deadline)
+                    obs.update(output={"count": len(papers)})
             except Exception as e:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return list(found.values())
+
                 log.warning("%s failed for %r: %s", name, kw, e)
                 continue
+
             for p in papers:
                 if year_from and p["year"] and p["year"] < year_from:
                     continue
+
                 old = found.setdefault(p["paper_id"], p)
-                if old is not p and old.get("citations") is None and p.get("citations") is not None:
+
+                if (
+                    old is not p
+                    and old.get("citations") is None
+                    and p.get("citations") is not None
+                ):
                     old["citations"] = p["citations"]
+
     return list(found.values())

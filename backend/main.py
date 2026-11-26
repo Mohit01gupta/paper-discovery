@@ -8,6 +8,9 @@ with a single worker (--workers 1) to avoid Qdrant directory lock conflicts.
 import logging
 from contextlib import asynccontextmanager
 from typing import Literal
+from fastapi import Query
+
+from . import guardrails, tracing, traces
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,14 +19,16 @@ from pydantic import BaseModel, Field
 from . import auth, chats, compare, config, graph, ingest, qa, store
 
 log = logging.getLogger(__name__)
-MAX_UPLOAD = 25 * 1024 * 1024
+MAX_UPLOAD = config.GUARD_PDF_MB * 1024 * 1024
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    auth.init()  # checks JWT_SECRET, creates the users table
-    yield
-
+    auth.init()
+    try:
+        yield
+    finally:
+        tracing.shutdown()
 
 app = FastAPI(title="Research Paper Discovery", lifespan=lifespan)
 if config.CORS_ORIGINS:
@@ -100,11 +105,46 @@ def login(req: LoginReq, request: Request):
 def me(user: dict = Depends(auth.current_user)):
     return user
 
+def _record_block(endpoint: str, user: dict, e: guardrails.Blocked) -> None:
+    log.warning("guardrail blocked endpoint=%s user=%s rule=%s", endpoint, user["username"], e.rule)
+    if e.rule == "scope":  # raised inside the trace, which already records it
+        return
+    with tracing.trace("blocked", user=user["username"], input={"endpoint": endpoint, "rule": e.rule}) as obs:
+        obs.update(level="WARNING", status_message=e.rule)  # rule only, never the text (it may hold a secret)
 
 @app.post("/search")
 def search(req: SearchReq, user: dict = Depends(auth.current_user)):
     try:
-        return graph.run_search(req.question, req.use_web)
+        question = guardrails.check_input(req.question)
+
+        with guardrails.slot(user["username"]):
+
+            with tracing.trace(
+                "search",
+                user=user["username"],
+                input={
+                    "question": question,
+                    "use_web": req.use_web,
+                },
+            ) as obs:
+
+                result = graph.run_search(question, req.use_web)
+
+                obs.update(output={
+                    "plan": result.get("plan", {}),
+                    "result_count": len(result.get("results", [])),
+                    "paper_ids": [
+                        p["paper_id"]
+                        for p in result.get("results", [])
+                    ],
+                })
+
+                return result
+
+    except guardrails.Blocked as e:
+        _record_block("search", user, e)
+        raise HTTPException(e.status, e.message)
+
     except Exception as e:
         raise _fail("Search failed", e)
 
@@ -121,11 +161,17 @@ def upload(file: UploadFile = File(...), admin: dict = Depends(auth.require_admi
         raise HTTPException(400, "Please upload a PDF")
     data = file.file.read(MAX_UPLOAD + 1)
     if len(data) > MAX_UPLOAD:
-        raise HTTPException(400, "PDF is larger than 25 MB")
+        raise HTTPException(
+            400,
+            f"PDF is larger than {config.GUARD_PDF_MB} MB",
+        )
     if not data.startswith(b"%PDF"):
         raise HTTPException(400, "File is not a valid PDF")
     try:
-        p = ingest.ingest_upload(file.filename, data)
+        with tracing.trace("upload", user=admin["username"],
+                           input={"filename": file.filename, "bytes": len(data)}) as obs:
+            p = ingest.ingest_upload(file.filename, data)
+            obs.update(output={"paper_id": p["paper_id"]})
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -225,21 +271,144 @@ def delete_chat(chat_id: str, user: dict = Depends(auth.current_user)):
 
 
 @app.post("/chats/{chat_id}/ask")
-def chat_ask(chat_id: str, req: ChatAsk, user: dict = Depends(auth.current_user)):
+def chat_ask(
+    chat_id: str,
+    req: ChatAsk,
+    user: dict = Depends(auth.current_user),
+):
     chat = _own_chat(user, chat_id)
+
     try:
-        res = qa.answer_question(req.question, req.paper_ids, chat["messages"][-4:])
+        question = guardrails.check_input(req.question)
+        history = chat["messages"][-4:]
+
+        with guardrails.slot(user["username"]):
+
+            with tracing.trace(
+                "ask",
+                user=user["username"],
+                session=chat_id,
+                input={
+                    "question": question,
+                    "paper_ids": req.paper_ids,
+                    "history_messages": len(history),
+                },
+            ) as obs:
+
+                res = qa.answer_question(
+                    question,
+                    req.paper_ids,
+                    history,
+                )
+
+                chats.add_exchange(
+                    user["username"],
+                    chat_id,
+                    question,
+                    res["answer"],
+                    res["sources"],
+                )
+
+                obs.update(output={
+                    "answer": res["answer"][:1000],
+                    "source_count": len(res["sources"]),
+                    "warnings": res.get("warnings", []),
+                    "masked_papers": len(res.get("masked_papers", [])),
+                })
+
+                return res
+
+    except guardrails.Blocked as e:
+        _record_block("ask", user, e)
+        raise HTTPException(e.status, e.message)
+
     except Exception as e:
         raise _fail("Question failed", e)
-    chats.add_exchange(user["username"], chat_id, req.question, res["answer"], res["sources"])
-    return res
-
 
 @app.post("/compare")
-def compare_endpoint(req: CompareReq, user: dict = Depends(auth.current_user)):
+def compare_endpoint(
+    req: CompareReq,
+    user: dict = Depends(auth.current_user),
+):
     try:
-        return compare.compare_papers(req.paper_ids, req.focus)
+        focus = (
+            guardrails.check_input(req.focus)
+            if req.focus and req.focus.strip()
+            else None
+        )
+
+        with guardrails.slot(user["username"]):
+
+            with tracing.trace(
+                "compare",
+                user=user["username"],
+                input={
+                    "question": "Compare selected papers: " + ", ".join(req.paper_ids),
+                    "paper_ids": req.paper_ids,
+                    "focus": focus,
+                },
+            ) as obs:
+
+                result = compare.compare_papers(
+                    req.paper_ids,
+                    focus,
+                )
+
+                obs.update(output={
+                    "paper_count": len(result.get("papers", [])),
+                    "paper_ids": [
+                        p.get("id")
+                        for p in result.get("papers", [])
+                    ],
+                    "summary": result.get("summary", "")[:500],
+                    "warnings": result.get("warnings", []),
+                    "error": result.get("error"),
+                })
+
+                if result.get("error"):
+                    obs.update(
+                        level="ERROR",
+                        status_message=str(result["error"])[:300],
+                    )
+
+                return result
+
+    except guardrails.Blocked as e:
+        _record_block("compare", user, e)
+        raise HTTPException(e.status, e.message)
+
     except ValueError as e:
         raise HTTPException(400, str(e))
+
     except Exception as e:
         raise _fail("Comparison failed", e)
+
+@app.get("/traces")
+def list_traces(
+    hours: int = Query(default=24, ge=1, le=720),
+    admin: dict = Depends(auth.require_admin),
+):
+    try:
+        return traces.list_traces(hours, limit=500)
+    except Exception as e:
+        raise _fail("Failed to load traces", e)
+
+
+@app.get("/traces/{trace_id}")
+def get_trace(
+    trace_id: str,
+    admin: dict = Depends(auth.require_admin),
+):
+    try:
+        result = traces.get_trace(trace_id)
+
+        if result is None:
+            raise HTTPException(404, "Trace not found")
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise _fail("Failed to load trace", e)

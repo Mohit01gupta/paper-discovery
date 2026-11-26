@@ -9,6 +9,7 @@ import time
 import pandas as pd
 import requests
 import streamlit as st
+from traces_tab import render as render_traces
 
 API = os.getenv("BACKEND_URL", "http://localhost:8000")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-in-production-secret-key").encode("utf-8")
@@ -399,7 +400,14 @@ def call(method, path, **kw):
         r.raise_for_status()
         return r.json()
     except requests.HTTPError as e:
-        st.error(f"{e.response.status_code}: {e.response.text[:300]}")
+        try:
+            msg = e.response.json().get("detail", e.response.text)
+        except ValueError:
+            msg = e.response.text
+        if e.response.status_code in (400, 403, 429):
+            st.warning(str(msg)[:300])
+        else:
+            st.error(f"{e.response.status_code}: {str(msg)[:300]}")
     except requests.RequestException as e:
         st.error(f"Backend not reachable: {e}")
     return None
@@ -566,13 +574,22 @@ else:
                 '</div>', unsafe_allow_html=True)
 
     tab_names = ["Search", "Compare"]
+
     if is_admin:
-        tab_names.extend(["Vector Search", "Upload PDF"])
+        tab_names.extend([
+            "Vector Search",
+            "Upload PDF",
+            "Traces",
+        ])
 
     tabs = st.tabs(tab_names)
-    tab_search, tab_compare = tabs[0], tabs[1]
+
+    tab_search = tabs[0]
+    tab_compare = tabs[1]
+
     tab_vectors = tabs[2] if is_admin else None
     tab_upload = tabs[3] if is_admin else None
+    tab_traces = tabs[4] if is_admin else None
 
     with tab_search:
         q = st.text_input("Ask a research question", placeholder="How can small language models run on phones?")
@@ -584,6 +601,8 @@ else:
                 plan = data["plan"]
                 st.caption(f"Query: {plan['semantic_query']}  |  Keywords: {', '.join(plan['keywords'])}"
                            + (f"  |  From {plan['year_from']}" if plan["year_from"] else ""))
+                if not data["results"]:
+                    st.info("No matching papers found. Try different wording or turn on web search.")
                 for p in data["results"]:
                     badges = chip(f"score {p['score']}", "cyan")
                     if p["fresh"]:
@@ -699,3 +718,6 @@ else:
                             st.write(h.get("text", ""))
                             if pid:
                                 st.caption(f"Paper ID: {pid}")
+    if is_admin and tab_traces is not None:
+        with tab_traces:
+            render_traces(call)    
